@@ -1,7 +1,13 @@
 mod ext;
 extern crate proc_macro;
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
+use proc_macro2::TokenStream as TokenStream2;
+use quote::{format_ident, quote};
 use std::collections::HashMap;
+use syn::{
+    Attribute, Data, DataEnum, DeriveInput, Expr, ExprLit, Fields, Lit, Meta, MetaNameValue,
+    Variant,
+};
 
 /// A procedural macro that derives a `Description` trait for enums.
 /// This macro extracts documentation comments (specified with `/// Description...`) for enum variants
@@ -120,7 +126,7 @@ fn generate_get_description(
     }
 
     let enum_impl = format!(
-        "impl {enum_name}  {{ 
+        "impl {enum_name}  {{
      pub fn get_description(&self) -> Option<&str> {{
      match self {{
      {all_enum_arms}
@@ -438,4 +444,619 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(VfsDerive)]
 pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     ext::derive_vfs_module(input)
+}
+
+/// Derives opcode functionality for database instruction enums.
+///
+/// This macro generates three methods:
+/// - `name()`: Returns the instruction name as a string
+/// - `description()`: Returns the instruction description
+/// - `explain()`: Returns detailed instruction information for debugging
+///
+/// It also generates an `OPCODE_DICTIONARY` constant containing all opcodes.
+///
+/// # Required Attributes
+///
+/// Each enum variant must have:
+/// - `#[description = "..."]` - Human readable description of what the instruction does
+///
+/// Each field that represents an opcode parameter must have one of:
+/// - `#[p1]` through `#[p5]` - Parameter position markers (up to 5 parameters supported)
+///
+/// # Optional Attributes
+///
+/// - `#[format = "..."]` - Custom format string for explain() method. Use `{p1}`, `{p2}`, etc.
+///   as placeholders for parameters. Defaults to a generic format if not specified.
+///
+/// # Example
+///
+/// ```rust
+/// #[derive(Opcode)]
+/// pub enum Insn {
+///     #[description = "Jump to P2 if r[P1] is true, or if r[P1] is null and r[P3] is true"]
+///     #[format = "if r[{p1}] goto {p2} else if null(r[{p1}]) and r[{p3}] goto {p2}"]
+///     If {
+///         #[p1] reg: usize,
+///         #[p2] target_pc: BranchOffset,
+///         #[p3] null_reg: usize,
+///     },
+///
+///     #[description = "Unconditional jump to target address"]
+///     #[format = "goto {p1}"]
+///     Goto {
+///         #[p1] target_pc: BranchOffset,
+///     },
+/// }
+/// ```
+///
+/// # Generated Code
+///
+/// The macro generates:
+/// - `name(&self) -> &'static str` - Returns variant name
+/// - `description(&self) -> &'static str` - Returns description from attribute
+/// - `explain(&self) -> InstructionExplanation` - Returns detailed explanation
+/// - `OPCODE_DICTIONARY: &[OpCodeDescription]` - Array of all opcodes and descriptions
+///
+/// # Errors
+///
+/// Compilation will fail if:
+/// - Applied to non-enum types
+/// - Any variant is missing `#[description = "..."]` attribute
+/// - Parameter attributes `#[p1]` through `#[p5]` are used incorrectly
+/// - The same parameter number is used twice in one variant
+/// - Format strings reference non-existent parameters
+#[proc_macro_derive(Opcode, attributes(description, format, p1, p2, p3, p4, p5))]
+pub fn derive_opcode(input: TokenStream) -> TokenStream {
+    derive_opcode_impl(input).unwrap_or_else(|err| err.to_compile_error().into())
+}
+
+/// Internal implementation that returns proper syn::Result for error handling
+fn derive_opcode_impl(input: TokenStream) -> syn::Result<TokenStream> {
+    let input: DeriveInput = syn::parse(input)?;
+    let enum_ident = &input.ident;
+
+    let Data::Enum(DataEnum { variants, .. }) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            enum_ident,
+            "Opcode can only be derived for enums",
+        ));
+    };
+
+    // Validate all variants and collect their information
+    let mut variant_info = Vec::new();
+    for variant in variants {
+        let info = validate_and_extract_variant(variant, enum_ident)?;
+        variant_info.push(info);
+    }
+
+    let mut arms_name = TokenStream2::new();
+    let mut arms_desc = TokenStream2::new();
+    let mut arms_exp = TokenStream2::new();
+    let mut dict_elems = TokenStream2::new();
+
+    for info in &variant_info {
+        expand_one_variant(
+            enum_ident,
+            info,
+            &mut arms_name,
+            &mut arms_desc,
+            &mut arms_exp,
+            &mut dict_elems,
+        );
+    }
+
+    // Generate unique type names to avoid conflicts
+    let explanation_type = format_ident!("{}InstructionExplanation", enum_ident);
+    let dictionary_name = format_ident!(
+        "{}_OPCODE_DICTIONARY",
+        enum_ident.to_string().to_uppercase()
+    );
+
+    let expanded = quote! {
+        /// Information about an instruction for debugging and explanation
+        #[derive(Debug, Clone)]
+        pub struct #explanation_type {
+            /// The instruction name
+            pub name: &'static str,
+            /// Parameter 1 value (0 if not used)
+            pub p1: i32,
+            /// Parameter 2 value (0 if not used)
+            pub p2: i32,
+            /// Parameter 3 value (0 if not used)
+            pub p3: i32,
+            /// Parameter 4 value (0 if not used)
+            pub p4: i32,
+            /// Parameter 5 value (0 if not used)
+            pub p5: i32,
+            /// Human-readable formatted explanation of what this instruction does
+            pub explanation: String,
+        }
+
+        impl #enum_ident {
+            /// Returns the name of this instruction as a static string
+            pub const fn name(&self) -> &'static str {
+                match self {
+                    #arms_name
+                }
+            }
+
+            /// Returns the description of this instruction as a static string
+            pub const fn description(&self) -> &'static str {
+                match self {
+                    #arms_desc
+                }
+            }
+
+            /// Returns detailed explanation of this instruction instance including parameter values
+            pub fn explain(&self) -> #explanation_type {
+                match self {
+                    #arms_exp
+                }
+            }
+        }
+
+        /// Dictionary of all opcodes with their names and descriptions
+        pub const #dictionary_name: &[OpCodeDescription] = &[#dict_elems];
+    };
+
+    Ok(expanded.into())
+}
+
+/// Information extracted from a validated enum variant
+#[derive(Debug)]
+struct VariantInfo {
+    ident: syn::Ident,
+    description: String,
+    format_string: Option<String>,
+    parameters: Vec<ParameterInfo>,
+    pattern: TokenStream2,
+}
+
+/// Information about a parameter in a variant
+#[derive(Debug)]
+struct ParameterInfo {
+    position: usize, // 1-5 for p1-p5
+    binding: syn::Ident,
+    field_name: Option<syn::Ident>, // None for tuple fields
+}
+
+/// Validates a variant and extracts all necessary information
+fn validate_and_extract_variant(
+    variant: &Variant,
+    enum_ident: &syn::Ident,
+) -> syn::Result<VariantInfo> {
+    let var_ident = variant.ident.clone();
+
+    // Extract and validate description attribute
+    let description = extract_description(&variant.attrs)?;
+
+    // Extract optional format string
+    let format_string = extract_format_string(&variant.attrs)?;
+
+    // Extract and validate parameters
+    let parameters = extract_parameters(variant)?;
+
+    // Validate format string references existing parameters
+    if let Some(ref fmt) = format_string {
+        validate_format_string(fmt, &parameters)?;
+    }
+
+    // Generate the pattern for matching
+    let pattern = generate_pattern(enum_ident, variant, &parameters)?;
+
+    Ok(VariantInfo {
+        ident: var_ident,
+        description,
+        format_string,
+        parameters,
+        pattern,
+    })
+}
+
+/// Extracts the description attribute value
+fn extract_description(attrs: &[Attribute]) -> syn::Result<String> {
+    let desc_attr = find_attr(attrs, "description").ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "Missing #[description = \"...\"] attribute on opcode variant",
+        )
+    })?;
+
+    parse_str_lit(desc_attr)
+}
+
+/// Extracts the optional format attribute value
+fn extract_format_string(attrs: &[Attribute]) -> syn::Result<Option<String>> {
+    if let Some(fmt_attr) = find_attr(attrs, "format") {
+        Ok(Some(parse_str_lit(fmt_attr)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Extracts and validates parameter information from variant fields
+fn extract_parameters(variant: &Variant) -> syn::Result<Vec<ParameterInfo>> {
+    let mut parameters = Vec::new();
+    let mut used_positions = std::collections::HashSet::new();
+
+    match &variant.fields {
+        Fields::Named(fields) => {
+            for field in &fields.named {
+                let field_name = field.ident.as_ref().ok_or_else(|| {
+                    syn::Error::new_spanned(field, "Named field missing identifier")
+                })?;
+
+                if let Some(position) = find_param_position(&field.attrs)? {
+                    if !used_positions.insert(position) {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            format!(
+                                "Parameter p{} is used more than once in this variant",
+                                position
+                            ),
+                        ));
+                    }
+
+                    let binding = format_ident!("_{}", field_name);
+                    parameters.push(ParameterInfo {
+                        position,
+                        binding,
+                        field_name: Some(field_name.clone()),
+                    });
+                }
+            }
+        }
+        Fields::Unnamed(fields) => {
+            for (idx, field) in fields.unnamed.iter().enumerate() {
+                if let Some(position) = find_param_position(&field.attrs)? {
+                    if !used_positions.insert(position) {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            format!(
+                                "Parameter p{} is used more than once in this variant",
+                                position
+                            ),
+                        ));
+                    }
+
+                    let binding = format_ident!("_f{}", idx);
+                    parameters.push(ParameterInfo {
+                        position,
+                        binding,
+                        field_name: None,
+                    });
+                }
+            }
+        }
+        Fields::Unit => {
+            // Unit variants have no parameters, which is fine
+        }
+    }
+
+    // Sort by position for consistent ordering
+    parameters.sort_by_key(|p| p.position);
+
+    Ok(parameters)
+}
+
+fn find_param_position(attrs: &[Attribute]) -> syn::Result<Option<usize>> {
+    for attr in attrs {
+        if let Some(ident) = attr.path().get_ident() {
+            if let Some(n_str) = ident.to_string().strip_prefix('p') {
+                if let Ok(n) = n_str.parse::<usize>() {
+                    if (1..=5).contains(&n) {
+                        if !matches!(attr.meta, Meta::Path(_)) {
+                            return Err(syn::Error::new_spanned(
+                                attr,
+                                format!("Attribute #[p{}] should not have a value", n),
+                            ));
+                        }
+                        return Ok(Some(n));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Validates that format string only references existing parameters
+fn validate_format_string(format_str: &str, parameters: &[ParameterInfo]) -> syn::Result<()> {
+    let available_params: std::collections::HashSet<usize> =
+        parameters.iter().map(|p| p.position).collect();
+
+    // Simple validation - look for {p1}, {p2}, etc. in format string
+    for n in 1..=5 {
+        let param_ref = format!("{{p{}}}", n);
+        if format_str.contains(&param_ref) && !available_params.contains(&n) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "Format string references {{p{}}} but no field has #[p{}] attribute",
+                    n, n
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Generates the pattern for matching this variant
+fn generate_pattern(
+    enum_ident: &syn::Ident,
+    variant: &Variant,
+    parameters: &[ParameterInfo],
+) -> syn::Result<TokenStream2> {
+    let var_ident = &variant.ident;
+
+    let bindings = match &variant.fields {
+        Fields::Named(_) => {
+            let mut inner = TokenStream2::new();
+
+            // Add bindings for parameter fields
+            for param in parameters {
+                if let Some(ref field_name) = param.field_name {
+                    let binding = &param.binding;
+                    inner.extend(quote! { #field_name: #binding, });
+                }
+            }
+
+            // Add bindings for non-parameter fields (using underscore to ignore)
+            if let Fields::Named(fields) = &variant.fields {
+                for field in &fields.named {
+                    let field_name = field.ident.as_ref().unwrap();
+                    // Only add if it's not already a parameter
+                    if !parameters
+                        .iter()
+                        .any(|p| p.field_name.as_ref() == Some(field_name))
+                    {
+                        inner.extend(quote! { #field_name: _, });
+                    }
+                }
+            }
+
+            quote! { { #inner } }
+        }
+        Fields::Unnamed(fields) => {
+            let mut inner = TokenStream2::new();
+
+            for (idx, _) in fields.unnamed.iter().enumerate() {
+                // Check if this field is a parameter
+                if let Some(param) = parameters
+                    .iter()
+                    .find(|p| p.field_name.is_none() && p.binding == format_ident!("_f{}", idx))
+                {
+                    let binding = &param.binding;
+                    inner.extend(quote! { #binding, });
+                } else {
+                    inner.extend(quote! { _, });
+                }
+            }
+
+            quote! { ( #inner ) }
+        }
+        Fields::Unit => quote! {},
+    };
+
+    Ok(quote! { #enum_ident::#var_ident #bindings })
+}
+
+/// Expands a single variant into the generated match arms
+fn expand_one_variant(
+    _enum_ident: &syn::Ident,
+    info: &VariantInfo,
+    arms_name: &mut TokenStream2,
+    arms_desc: &mut TokenStream2,
+    arms_exp: &mut TokenStream2,
+    dict_elems: &mut TokenStream2,
+) {
+    let var_name = info.ident.to_string();
+    let description = &info.description;
+    let pattern = &info.pattern;
+
+    // Generate name match arm
+    arms_name.extend(quote! { #pattern => #var_name, });
+
+    // Generate description match arm
+    arms_desc.extend(quote! { #pattern => #description, });
+
+    // Generate parameter values array (p1-p5)
+    let mut param_values = vec![quote! { 0i32 }; 5];
+    for param in &info.parameters {
+        let binding = &param.binding;
+        param_values[param.position - 1] = quote! { (*#binding) as i32 };
+    }
+
+    // // Generate explanation string
+    // let explanation = if let Some(ref format_str) = info.format_string {
+    //     // Use custom format string, replacing {p1}, {p2}, etc. with actual values
+    //     let mut explanation_parts = Vec::new();
+    //     let mut current_str = format_str.as_str();
+
+    //     while let Some(start) = current_str.find('{') {
+    //         if let Some(end) = current_str[start..].find('}') {
+    //             let end = start + end;
+
+    //             // Add the text before the placeholder
+    //             if start > 0 {
+    //                 let before = &current_str[..start];
+    //                 explanation_parts.push(quote! { #before });
+    //             }
+
+    //             // Handle the placeholder
+    //             let placeholder = &current_str[start + 1..end];
+    //             if let Some(param_num) = placeholder
+    //                 .strip_prefix('p')
+    //                 .and_then(|s| s.parse::<usize>().ok())
+    //             {
+    //                 if param_num >= 1 && param_num <= 5 {
+    //                     if let Some(param) =
+    //                         info.parameters.iter().find(|p| p.position == param_num)
+    //                     {
+    //                         let binding = &param.binding;
+    //                         explanation_parts.push(quote! { &#binding.to_string() });
+    //                     } else {
+    //                         explanation_parts.push(quote! { "0" });
+    //                     }
+    //                 } else {
+    //                     explanation_parts.push(quote! { #placeholder });
+    //                 }
+    //             } else {
+    //                 explanation_parts.push(quote! { #placeholder });
+    //             }
+
+    //             current_str = &current_str[end + 1..];
+    //         } else {
+    //             break;
+    //         }
+    //     }
+
+    //     // Add any remaining text
+    //     if !current_str.is_empty() {
+    //         explanation_parts.push(quote! { #current_str });
+    //     }
+
+    //     if explanation_parts.is_empty() {
+    //         quote! { String::new() }
+    //     } else {
+    //         quote! { [#(#explanation_parts),*].concat() }
+    //     }
+    // } else {
+    //     // Default format: just show the instruction name and key parameters
+    //     if info.parameters.is_empty() {
+    //         quote! { #var_name.to_string() }
+    //     } else {
+    //         let first_param = &info.parameters[0].binding;
+    //         if info.parameters.len() == 1 {
+    //             quote! { format!("{} {}", #var_name, #first_param) }
+    //         } else {
+    //             let second_param = &info.parameters[1].binding;
+    //             quote! { format!("{} {} {}", #var_name, #first_param, #second_param) }
+    //         }
+    //     }
+    // };
+
+    // Generate explanation string
+    let explanation = if let Some(ref format_str) = info.format_string {
+        // Use custom format string, replacing {p1}, {p2}, etc. with actual values
+        let mut format_parts = Vec::new();
+        let mut format_args = Vec::new();
+        let mut current_str = format_str.as_str();
+
+        while let Some(start) = current_str.find('{') {
+            if let Some(end) = current_str[start..].find('}') {
+                let end = start + end;
+
+                // Add the text before the placeholder
+                if start > 0 {
+                    let before = &current_str[..start];
+                    format_parts.push(before.to_string());
+                }
+
+                // Handle the placeholder
+                let placeholder = &current_str[start + 1..end];
+                if let Some(param_num) = placeholder
+                    .strip_prefix('p')
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    if param_num >= 1 && param_num <= 5 {
+                        if let Some(param) =
+                            info.parameters.iter().find(|p| p.position == param_num)
+                        {
+                            let binding = &param.binding;
+                            format_parts.push("{}".to_string());
+                            format_args.push(quote! { #binding });
+                        } else {
+                            format_parts.push("0".to_string());
+                        }
+                    } else {
+                        format_parts.push(format!("{{{}}}", placeholder));
+                    }
+                } else {
+                    format_parts.push(format!("{{{}}}", placeholder));
+                }
+
+                current_str = &current_str[end + 1..];
+            } else {
+                break;
+            }
+        }
+
+        // Add any remaining text
+        if !current_str.is_empty() {
+            format_parts.push(current_str.to_string());
+        }
+
+        if format_args.is_empty() {
+            // No parameters, just use the string literal
+            let combined = format_parts.join("");
+            quote! { #combined.to_string() }
+        } else {
+            // Use format! macro with the arguments
+            let format_str = format_parts.join("");
+            quote! { format!(#format_str, #(#format_args),*) }
+        }
+    } else {
+        // Default format: just show the instruction name and key parameters
+        if info.parameters.is_empty() {
+            quote! { #var_name.to_string() }
+        } else {
+            let first_param = &info.parameters[0].binding;
+            if info.parameters.len() == 1 {
+                quote! { format!("{} {}", #var_name, #first_param) }
+            } else {
+                let second_param = &info.parameters[1].binding;
+                quote! { format!("{} {} {}", #var_name, #first_param, #second_param) }
+            }
+        }
+    };
+
+    // Generate explain match arm
+    let p1 = &param_values[0];
+    let p2 = &param_values[1];
+    let p3 = &param_values[2];
+    let p4 = &param_values[3];
+    let p5 = &param_values[4];
+
+    let explanation_type = format_ident!("{}InstructionExplanation", _enum_ident);
+
+    arms_exp.extend(quote! {
+        #pattern => #explanation_type {
+            name: #var_name,
+            p1: #p1,
+            p2: #p2,
+            p3: #p3,
+            p4: #p4,
+            p5: #p5,
+            explanation: #explanation,
+        },
+    });
+
+    // Generate dictionary element
+    dict_elems.extend(quote! {
+        OpCodeDescription { name: #var_name, description: #description },
+    });
+}
+
+/// Finds an attribute by name
+fn find_attr<'a>(attrs: &'a [Attribute], want: &str) -> Option<&'a Attribute> {
+    attrs.iter().find(|a| a.path().is_ident(want))
+}
+
+/// Parses a string literal from an attribute
+fn parse_str_lit(attr: &Attribute) -> syn::Result<String> {
+    match &attr.meta {
+        Meta::NameValue(MetaNameValue {
+            value: Expr::Lit(ExprLit {
+                lit: Lit::Str(s), ..
+            }),
+            ..
+        }) => Ok(s.value()),
+        _ => Err(syn::Error::new_spanned(
+            attr,
+            "Attribute must be of the form #[attr = \"string value\"]",
+        )),
+    }
 }

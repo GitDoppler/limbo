@@ -586,6 +586,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso_core",
+ "turso_macros",
  "zerocopy 0.8.26",
 ]
 
