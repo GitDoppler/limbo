@@ -478,7 +478,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
 ///     If {
 ///         #[p1] reg: usize,
 ///         #[p2] target_pc: BranchOffset,
-///         #[p3] null_reg: usize,
+///         #[p3] jump_if_null: bool,
 ///     },
 ///
 ///     #[description = "Unconditional jump to target address"]
@@ -868,75 +868,6 @@ fn expand_one_variant(
         let binding = &param.binding;
         param_values[param.position - 1] = quote! { (*#binding) as i32 };
     }
-
-    // // Generate explanation string
-    // let explanation = if let Some(ref format_str) = info.format_string {
-    //     // Use custom format string, replacing {p1}, {p2}, etc. with actual values
-    //     let mut explanation_parts = Vec::new();
-    //     let mut current_str = format_str.as_str();
-
-    //     while let Some(start) = current_str.find('{') {
-    //         if let Some(end) = current_str[start..].find('}') {
-    //             let end = start + end;
-
-    //             // Add the text before the placeholder
-    //             if start > 0 {
-    //                 let before = &current_str[..start];
-    //                 explanation_parts.push(quote! { #before });
-    //             }
-
-    //             // Handle the placeholder
-    //             let placeholder = &current_str[start + 1..end];
-    //             if let Some(param_num) = placeholder
-    //                 .strip_prefix('p')
-    //                 .and_then(|s| s.parse::<usize>().ok())
-    //             {
-    //                 if param_num >= 1 && param_num <= 5 {
-    //                     if let Some(param) =
-    //                         info.parameters.iter().find(|p| p.position == param_num)
-    //                     {
-    //                         let binding = &param.binding;
-    //                         explanation_parts.push(quote! { &#binding.to_string() });
-    //                     } else {
-    //                         explanation_parts.push(quote! { "0" });
-    //                     }
-    //                 } else {
-    //                     explanation_parts.push(quote! { #placeholder });
-    //                 }
-    //             } else {
-    //                 explanation_parts.push(quote! { #placeholder });
-    //             }
-
-    //             current_str = &current_str[end + 1..];
-    //         } else {
-    //             break;
-    //         }
-    //     }
-
-    //     // Add any remaining text
-    //     if !current_str.is_empty() {
-    //         explanation_parts.push(quote! { #current_str });
-    //     }
-
-    //     if explanation_parts.is_empty() {
-    //         quote! { String::new() }
-    //     } else {
-    //         quote! { [#(#explanation_parts),*].concat() }
-    //     }
-    // } else {
-    //     // Default format: just show the instruction name and key parameters
-    //     if info.parameters.is_empty() {
-    //         quote! { #var_name.to_string() }
-    //     } else {
-    //         let first_param = &info.parameters[0].binding;
-    //         if info.parameters.len() == 1 {
-    //             quote! { format!("{} {}", #var_name, #first_param) }
-    //         } else {
-    //             let second_param = &info.parameters[1].binding;
-    //             quote! { format!("{} {} {}", #var_name, #first_param, #second_param) }
-    //         }
-    //     }
-    // };
 
     // Generate explanation string
     let explanation = if let Some(ref format_str) = info.format_string {
